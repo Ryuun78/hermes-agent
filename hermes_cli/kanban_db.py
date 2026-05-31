@@ -3502,6 +3502,144 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class RecordGateBlockedError(ValueError):
+    """Raised when a record-required task tries to complete without evidence."""
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            "record_required 카드입니다. result에 문서번호(예: 2026-DEV-173) "
+            "또는 등재된 .md 경로를 기록한 뒤 다시 완료하세요."
+        )
+
+
+_RECORD_REQUIRED_RE = re.compile(r"\brecord_required\s*[:=]\s*Y\b", re.IGNORECASE)
+_RECORD_DOC_ID_RE = re.compile(r"\b2026-[A-Z]{2,4}-\d{2,4}\b")
+_RECORD_MD_PATH_RE = re.compile(r"(?<![\w./-])[^\s`'\"<>|]+\.md(?=$|[\s`'\"<>|,;:)\]}])")
+
+
+def _record_gate_enabled() -> bool:
+    raw = os.environ.get("HERMES_RECORD_GATE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _record_gate_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _task_is_record_required(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    task_body: Optional[str],
+    task_result: Optional[str],
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> bool:
+    chunks: list[str] = [
+        _record_gate_text(task_body),
+        _record_gate_text(task_result),
+        _record_gate_text(result),
+        _record_gate_text(summary),
+        _record_gate_text(metadata),
+    ]
+    chunks.extend(
+        row["metadata"] or ""
+        for row in conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id = ? AND metadata IS NOT NULL",
+            (task_id,),
+        ).fetchall()
+    )
+    chunks.extend(
+        row["body"] or ""
+        for row in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
+    )
+    return any(_RECORD_REQUIRED_RE.search(chunk) for chunk in chunks if chunk)
+
+
+def _record_gate_has_completion_evidence(
+    *,
+    task_result: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+) -> bool:
+    evidence_text = "\n".join(
+        chunk
+        for chunk in (
+            _record_gate_text(task_result),
+            _record_gate_text(result),
+            _record_gate_text(metadata),
+        )
+        if chunk
+    )
+    if not evidence_text:
+        return False
+    return bool(_RECORD_DOC_ID_RE.search(evidence_text) or _RECORD_MD_PATH_RE.search(evidence_text))
+
+
+def _enforce_record_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    if not _record_gate_enabled():
+        return
+    row = conn.execute(
+        "SELECT body, result FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    if not _task_is_record_required(
+        conn,
+        task_id,
+        task_body=row["body"],
+        task_result=row["result"],
+        result=result,
+        summary=summary,
+        metadata=metadata,
+    ):
+        return
+    if _record_gate_has_completion_evidence(
+        task_result=row["result"],
+        result=result,
+        metadata=metadata,
+    ):
+        return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "completion_blocked_record_required",
+            {
+                "reason": "missing_record_evidence",
+                "required_evidence": [
+                    "document id matching 2026-XXX-NNN",
+                    "Obsidian vault-relative .md path",
+                ],
+                "message": (
+                    "record_required 카드입니다. result에 문서번호 또는 "
+                    ".md 경로를 기록한 뒤 다시 완료하세요."
+                ),
+            },
+        )
+    raise RecordGateBlockedError(task_id)
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3568,6 +3706,14 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    _enforce_record_gate(
+        conn,
+        task_id,
+        result=result,
+        summary=summary,
+        metadata=metadata,
+    )
 
     with write_txn(conn):
         if expected_run_id is None:
