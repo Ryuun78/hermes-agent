@@ -106,7 +106,7 @@ class CodexAppServerClient:
                     "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
                     "-c",
-                    "sandbox_workspace_write.network_access=false",
+                    "sandbox_workspace_write.network_access=true",
                 ]
             )
 

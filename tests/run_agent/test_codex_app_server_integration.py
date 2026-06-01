@@ -84,6 +84,41 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_codex_app_server_turn_timeout_is_forwarded(self, monkeypatch):
+        """Cron sets codex_app_server_turn_timeout on AIAgent; the runtime
+        must pass it into CodexAppServerSession.run_turn instead of falling
+        back to the session's 600s default."""
+        from agent.transports.codex_app_server_session import (
+            CodexAppServerSession, TurnResult,
+        )
+
+        captured = {}
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured.update(kwargs)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[
+                    {"role": "assistant", "content": "done"},
+                ],
+                turn_id="turn-timeout",
+                thread_id="thread-timeout",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-timeout"
+        )
+
+        agent = _make_codex_agent()
+        agent.codex_app_server_turn_timeout = 1800.0
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("long media job")
+
+        assert result["completed"] is True
+        assert captured["turn_timeout"] == 1800.0
+
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()
         with patch.object(agent, "_spawn_background_review", return_value=None):

@@ -65,8 +65,20 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    turn_kwargs: Dict[str, Any] = {}
+    turn_timeout = getattr(agent, "codex_app_server_turn_timeout", None)
+    if (
+        isinstance(turn_timeout, (int, float))
+        and not isinstance(turn_timeout, bool)
+        and float(turn_timeout) > 0
+    ):
+        turn_kwargs["turn_timeout"] = float(turn_timeout)
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            **turn_kwargs,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
