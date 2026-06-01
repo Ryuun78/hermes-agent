@@ -1288,6 +1288,18 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "fields": ["model", "context_pct", "cwd"],  # Order shown; drop any to hide
         },
+        # Gateway final-message Chief orchestra status board.
+        # Disabled by default; opt in per platform with
+        # display.platforms.telegram.orchestra_status.enabled=true.
+        "orchestra_status": {
+            "enabled": False,
+            "from_kanban": True,
+            "only_when_active": True,
+            "title": "현재 진행상황",
+            "max_chars": 1600,
+            "timeout_seconds": 2,
+            "script": "/Users/ryuun_mac_mini/.hermes/scripts/hermes_orchestra_status.py",
+        },
         "copy_shortcut": "auto",  # "auto" (platform default) | "ctrl_c" | "ctrl_shift_c" | "disabled"
     },
 

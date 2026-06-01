@@ -678,6 +678,59 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_launchd_status_uses_print_when_list_would_miss_loaded_job(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+
+        label = gateway_cli.get_launchd_label()
+        target = f"{gateway_cli._launchd_domain()}/{label}"
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ["launchctl", "print", target]:
+                return SimpleNamespace(returncode=0, stdout="state = running\n\tpid = 12345\n", stderr="")
+            if cmd == ["launchctl", "list", label]:
+                return SimpleNamespace(returncode=113, stdout="", stderr="Could not find service")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        output = capsys.readouterr().out
+        assert "Gateway service is loaded" in output
+        assert "state = running" in output
+        assert "not loaded" not in output
+
+    def test_launchd_plist_normalization_allows_record_gate_and_workdir_variants(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "home"
+        project_root = tmp_path / "home" / "hermes-agent"
+        hermes_home.mkdir()
+        project_root.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", project_root)
+
+        expected = """<plist><dict>
+            <key>EnvironmentVariables</key><dict>
+                <key>PATH</key><string>/generated/path</string>
+            </dict>
+            <key>WorkingDirectory</key><string>{home}</string>
+        </dict></plist>""".format(home=hermes_home)
+        installed = """<plist><dict>
+            <key>EnvironmentVariables</key><dict>
+                <key>HERMES_RECORD_GATE</key><string>1</string>
+                <key>PATH</key><string>/installed/path</string>
+            </dict>
+            <key>WorkingDirectory</key><string>{project}</string>
+        </dict></plist>""".format(project=project_root)
+
+        assert (
+            gateway_cli._normalize_launchd_plist_for_comparison(installed)
+            == gateway_cli._normalize_launchd_plist_for_comparison(expected)
+        )
+
 
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):

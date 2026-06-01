@@ -109,25 +109,28 @@ def _get_service_pids() -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
-        try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
+        loaded, output = _launchd_service_status(get_launchd_label())
+        if loaded:
+            for line in output.strip().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("pid = "):
+                    try:
+                        pid = int(stripped.split("=", 1)[1].strip())
+                        if pid > 0:
+                            pids.add(pid)
+                    except ValueError:
+                        pass
+                else:
+                    # Legacy ``launchctl list`` output:
+                    # "PID\tStatus\tLabel" header, then one data line.
+                    parts = stripped.split()
+                    if len(parts) >= 3 and parts[2] == get_launchd_label():
                         try:
                             pid = int(parts[0])
                             if pid > 0:
                                 pids.add(pid)
                         except ValueError:
                             pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
 
     return pids
 
@@ -957,16 +960,8 @@ def _recover_pending_systemd_restart(system: bool = False, previous_pid: int | N
 def _probe_launchd_service_running() -> bool:
     if not get_launchd_plist_path().exists():
         return False
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    return result.returncode == 0
+    loaded, _ = _launchd_service_status(get_launchd_label())
+    return loaded
 
 
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
@@ -2310,16 +2305,63 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
     invoking shell so user-installed tools remain reachable under launchd.
     That makes raw text comparison unstable across shells, so ignore the PATH
     payload when deciding whether the installed plist is stale.
+
+    Some operators also add runtime-only environment keys, such as
+    HERMES_RECORD_GATE, directly to the installed LaunchAgent. Those keys are
+    valid operational policy, not evidence that the service definition is
+    stale. Likewise, older macOS plists may use the project checkout as
+    WorkingDirectory while newer generated plists prefer HERMES_HOME. Both are
+    acceptable when they point at the current Hermes install.
     """
+    import plistlib
     import re
 
+    try:
+        data = plistlib.loads(text.encode("utf-8"))
+        if isinstance(data, dict):
+            env = data.get("EnvironmentVariables")
+            if isinstance(env, dict):
+                if "PATH" in env:
+                    env["PATH"] = "__HERMES_PATH__"
+                env.pop("HERMES_RECORD_GATE", None)
+            try:
+                allowed_workdirs = {
+                    str(get_hermes_home().resolve()),
+                    str(PROJECT_ROOT.resolve()),
+                }
+                if data.get("WorkingDirectory") in allowed_workdirs:
+                    data["WorkingDirectory"] = "__HERMES_WORKDIR__"
+            except Exception:
+                pass
+            return plistlib.dumps(data, sort_keys=True).decode("utf-8").strip()
+    except Exception:
+        pass
+
     normalized = _normalize_service_definition(text)
-    return re.sub(
+    normalized = re.sub(
         r'(<key>PATH</key>\s*<string>)(.*?)(</string>)',
         r'\1__HERMES_PATH__\3',
         normalized,
         flags=re.S,
     )
+    normalized = re.sub(
+        r'\s*<key>HERMES_RECORD_GATE</key>\s*<string>.*?</string>',
+        "",
+        normalized,
+        flags=re.S,
+    )
+    try:
+        hermes_home = re.escape(str(get_hermes_home().resolve()))
+        project_root = re.escape(str(PROJECT_ROOT.resolve()))
+        normalized = re.sub(
+            rf'(<key>WorkingDirectory</key>\s*<string>)(?:{hermes_home}|{project_root})(</string>)',
+            r'\1__HERMES_WORKDIR__\2',
+            normalized,
+            flags=re.S,
+        )
+    except Exception:
+        pass
+    return normalized
 
 
 def systemd_unit_is_current(system: bool = False) -> bool:
@@ -2833,6 +2875,44 @@ def _launchd_domain() -> str:
     return f"gui/{os.getuid()}"  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
 
 
+def _launchd_print_job(label: str | None = None):
+    """Return ``launchctl print`` output for a launchd job.
+
+    On recent macOS releases ``launchctl list <label>`` can fail even when the
+    job is loaded and running in the user's GUI domain. ``launchctl print
+    gui/<uid>/<label>`` is the authoritative view for these LaunchAgents.
+    """
+    target = f"{_launchd_domain()}/{label or get_launchd_label()}"
+    try:
+        return subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _launchd_service_status(label: str | None = None) -> tuple[bool, str]:
+    """Return (loaded, diagnostic output) for a launchd gateway service."""
+    label = label or get_launchd_label()
+    result = _launchd_print_job(label)
+    if result is not None and result.returncode == 0:
+        return True, result.stdout
+
+    try:
+        legacy = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return legacy.returncode == 0, legacy.stdout or legacy.stderr
+    except subprocess.TimeoutExpired:
+        return False, ""
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     # Stable cwd anchor — never the volatile source checkout. See
@@ -3117,18 +3197,7 @@ def launchd_restart():
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        loaded = result.returncode == 0
-        loaded_output = result.stdout
-    except subprocess.TimeoutExpired:
-        loaded = False
-        loaded_output = ""
+    loaded, loaded_output = _launchd_service_status(label)
 
     print(f"Launchd plist: {plist_path}")
     if launchd_plist_is_current():
@@ -4208,14 +4277,8 @@ def _is_service_running() -> bool:
 
         return False
     elif is_macos() and get_launchd_plist_path().exists():
-        try:
-            result = subprocess.run(
-                ["launchctl", "list", get_launchd_label()],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            return False
+        loaded, _ = _launchd_service_status(get_launchd_label())
+        return loaded
     elif is_windows():
         from hermes_cli import gateway_windows
         if gateway_windows.is_installed():

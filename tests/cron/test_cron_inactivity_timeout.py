@@ -209,6 +209,20 @@ class TestInactivityTimeout:
         _cron_timeout = self._parse_cron_timeout(raw)
         assert _cron_timeout == 600.0
 
+    def test_per_job_timeout_overrides_env_var(self, monkeypatch):
+        """A job-specific timeout should win over the global cron timeout."""
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "600")
+        assert scheduler._resolve_job_timeout({"timeout_seconds": 1800}) == 1800.0
+
+    def test_cron_timeout_seconds_alias(self, monkeypatch):
+        """cron_timeout_seconds is accepted for explicit cron job records."""
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "600")
+        assert scheduler._resolve_job_timeout({"cron_timeout_seconds": "1200"}) == 1200.0
+
     def test_timeout_error_includes_diagnostics(self):
         """The TimeoutError message should include last activity info."""
         agent = SlowFakeAgent(

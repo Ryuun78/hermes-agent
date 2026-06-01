@@ -37,10 +37,17 @@ Use this skill when the user:
 
 **Location:** Set via `WIKI_PATH` environment variable (e.g. in `~/.hermes/.env`).
 
-If unset, defaults to `~/wiki`.
+If `WIKI_PATH` is unset but `OBSIDIAN_VAULT_PATH` is set, use the Obsidian vault
+as the wiki root. If both are unset, default to `~/wiki`.
 
 ```bash
-WIKI="${WIKI_PATH:-$HOME/wiki}"
+if [ -n "${WIKI_PATH:-}" ]; then
+  WIKI="$WIKI_PATH"
+elif [ -n "${OBSIDIAN_VAULT_PATH:-}" ]; then
+  WIKI="$OBSIDIAN_VAULT_PATH"
+else
+  WIKI="$HOME/wiki"
+fi
 ```
 
 The wiki is just a directory of markdown files — open it in Obsidian, VS Code, or
@@ -78,7 +85,13 @@ When the user has an existing wiki, **always orient yourself before doing anythi
 ③ **Scan recent `log.md`** — read the last 20-30 entries to understand recent activity.
 
 ```bash
-WIKI="${WIKI_PATH:-$HOME/wiki}"
+if [ -n "${WIKI_PATH:-}" ]; then
+  WIKI="$WIKI_PATH"
+elif [ -n "${OBSIDIAN_VAULT_PATH:-}" ]; then
+  WIKI="$OBSIDIAN_VAULT_PATH"
+else
+  WIKI="$HOME/wiki"
+fi
 # Orientation reads at session start
 read_file "$WIKI/SCHEMA.md"
 read_file "$WIKI/index.md"
@@ -98,7 +111,7 @@ at hand before creating anything new.
 
 When the user asks to create or start a wiki:
 
-1. Determine the wiki path (from `$WIKI_PATH` env var, or ask the user; default `~/wiki`)
+1. Determine the wiki path (from `$WIKI_PATH`, then `$OBSIDIAN_VAULT_PATH`, or ask the user; default `~/wiki`)
 2. Create the directory structure above
 3. Ask the user what domain the wiki covers — be specific
 4. Write `SCHEMA.md` customized to the domain (see template below)
@@ -415,8 +428,9 @@ For best results:
 - Enable "Wikilinks" in Obsidian settings (usually on by default)
 - Install Dataview plugin for queries like `TABLE tags FROM "entities" WHERE contains(tags, "company")`
 
-If using the Obsidian skill alongside this one, set `OBSIDIAN_VAULT_PATH` to the
-same directory as the wiki path.
+If using the Obsidian skill alongside this one, prefer setting `OBSIDIAN_VAULT_PATH`
+to the vault directory and leaving `WIKI_PATH` unset unless you need a separate
+wiki root. When both are set, `WIKI_PATH` wins.
 
 ### Obsidian Headless (servers and headless machines)
 

@@ -120,6 +120,70 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CHIEF_AUTO_INTAKE_TRIGGER_RE = re.compile(
+    r"("
+    r"(?:카드|칸반|kanban).{0,16}(?:등록|생성|만들|올려|접수)"
+    r"|(?:등록|접수).{0,16}(?:카드|칸반|kanban)"
+    r"|(?:담당|에이전트|팀장).{0,24}(?:붙여|배정|나눠|라우팅|맡겨)"
+    r"|(?:비서실장|chief).{0,16}(?:접수|등록|라우팅)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_CHIEF_AUTO_INTAKE_STRIP_RE = re.compile(
+    r"("
+    r"(?:이\s*)?(?:업무|일|작업|건)?\s*(?:을|를)?\s*(?:카드|칸반|kanban)(?:으로|로)?\s*"
+    r"(?:등록|생성|만들어|만들|올려|접수)(?:해줘|해주세요|해|해라)?"
+    r"|(?:카드|칸반|kanban)(?:으로|로|에)?\s*(?:올려줘|올려|등록해줘|등록해|만들어줘|만들어)"
+    r"|(?:담당|에이전트|팀장)(?:을|를)?\s*(?:붙여서|붙여|배정해서|배정|나눠서|나눠|라우팅해서|라우팅|맡겨서|맡겨)"
+    r"|(?:비서실장|chief)(?:이|가)?\s*(?:접수|등록|라우팅)(?:해줘|해주세요|해)?"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_CHIEF_AUTO_INTAKE_UNDERSPECIFIED_RE = re.compile(
+    r"^(?:이거|이것|이\s*일|이\s*작업|이\s*건|방금\s*(?:것|내용)|위\s*(?:내용|건))\s*$",
+    re.IGNORECASE,
+)
+
+_CHIEF_STATUS_REQUEST_RE = re.compile(
+    r"("
+    r"^(?:chief\s*)?(?:진행\s*판|진행\s*현황|현재\s*진행\s*상황|오케스트라\s*현황|업무\s*현황|작업\s*현황)"
+    r"(?:을|를|이|가)?\s*(?:보여줘|보여주세요|알려줘|알려주세요|조회해줘|조회|확인해줘|확인|브리핑해줘|브리핑)?$"
+    r"|^(?:지금|현재)\s*(?:뭐|무엇|어떤\s*일|무슨\s*일).{0,16}(?:진행\s*중|진행되고|하고\s*있|돌아가)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _chief_auto_intake_candidate(text: str) -> Optional[str]:
+    """Return task text for Chief auto-intake, empty string if underspecified."""
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    if not _CHIEF_AUTO_INTAKE_TRIGGER_RE.search(raw):
+        return None
+    candidate = _CHIEF_AUTO_INTAKE_STRIP_RE.sub("", raw)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" \t\r\n:：-–—,.，。")
+    candidate = re.sub(
+        r"\s*(?:진행해줘|진행해주세요|진행해|진행|처리해줘|처리해주세요|처리해|처리)$",
+        "",
+        candidate,
+    ).strip()
+    candidate = re.sub(r"\s*(?:을|를)$", "", candidate).strip()
+    if len(candidate) < 6 or _CHIEF_AUTO_INTAKE_UNDERSPECIFIED_RE.match(candidate):
+        return ""
+    return candidate
+
+
+def _chief_status_request(text: str) -> bool:
+    """Whether plain text is an explicit request for the Chief status board."""
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/"):
+        return False
+    normalized = re.sub(r"\s+", " ", raw).strip(" \t\r\n?？!！.。")
+    return bool(_CHIEF_STATUS_REQUEST_RE.search(normalized))
+
 _GATEWAY_RATE_LIMIT_RE = re.compile(
     r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)",
     re.IGNORECASE,
@@ -7755,6 +7819,9 @@ class GatewayRunner:
         if canonical == "agents":
             return await self._handle_agents_command(event)
 
+        if canonical == "chief":
+            return await self._handle_chief_command(event)
+
         if canonical == "platform":
             return await self._handle_platform_command(event)
 
@@ -8044,6 +8111,10 @@ class GatewayRunner:
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
+
+        _chief_plain_reply = await self._maybe_handle_chief_plain_text(event, command)
+        if _chief_plain_reply is not None:
+            return _chief_plain_reply
 
         if self._is_telegram_topic_root_lobby(source):
             # Debounce the lobby reminder so a user who forgets about
@@ -9952,6 +10023,151 @@ class GatewayRunner:
         if len(output) > 3800:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
+
+    async def _handle_chief_command(self, event: MessageEvent) -> str:
+        """Create a Chief-routed Kanban card from a Telegram slash command."""
+        import asyncio
+        import json
+        import shlex
+        import subprocess
+        from pathlib import Path
+
+        raw = event.get_command_args().strip()
+        if not raw:
+            return (
+                "사용법: /chief 처리할 업무를 적어주세요.\n"
+                "예: /chief 내일 안전교육 인사말을 현장 기준으로 검토해\n"
+                "현황 조회: /chief status"
+            )
+
+        raw_key = raw.strip().lower()
+        if raw_key in {"help", "도움말", "사용법"}:
+            return (
+                "Chief 명령 사용법\n\n"
+                "- /chief [업무 지시]: 담당 에이전트에 Kanban 접수\n"
+                "- /chief status: 현재 오케스트라 현황판 조회\n"
+                "- /intake, /route: /chief와 같은 접수 명령\n\n"
+                "예: /chief 문서대장 정합성 점검을 담당 붙여서 진행해"
+            )
+        if raw_key in {"status", "list", "현황", "진행상황", "상태", "board", "보드"}:
+            status_script = Path("/Users/ryuun_mac_mini/.hermes/scripts/hermes_orchestra_status.py")
+
+            def _status() -> str:
+                proc = subprocess.run(
+                    [str(status_script), "--from-kanban"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError((proc.stderr or proc.stdout or "orchestra status failed").strip())
+                return proc.stdout.strip()
+
+            try:
+                board = await asyncio.to_thread(_status)
+            except Exception as exc:
+                return f"⚠ Chief 현황판 조회 실패: {exc}"
+            return board or "현재 표시할 진행상황이 없습니다."
+
+        title = raw.splitlines()[0].strip()
+        if len(title) > 80:
+            title = title[:77].rstrip() + "..."
+        script = Path("/Users/ryuun_mac_mini/.hermes/scripts/hermes_chief_intake.py")
+
+        def _preview() -> dict:
+            proc = subprocess.run(
+                [
+                    str(script),
+                    title,
+                    "--body",
+                    raw,
+                    "--record-required",
+                    "--dry-run",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError((proc.stderr or proc.stdout or "chief intake failed").strip())
+            return json.loads(proc.stdout)
+
+        try:
+            preview = await asyncio.to_thread(_preview)
+        except Exception as exc:
+            return f"⚠ Chief 접수카드 생성 준비 실패: {exc}"
+
+        assignee = str(preview.get("assignee") or "triage")
+        body = str(preview.get("body") or raw)
+        cmd_parts = [
+            "/kanban",
+            "create",
+            title,
+            "--body",
+            body,
+            "--created-by",
+            "chief",
+            "--priority",
+            str(preview.get("priority", 0)),
+        ]
+        if assignee == "triage":
+            cmd_parts.append("--triage")
+        else:
+            cmd_parts.extend(["--assignee", assignee])
+        event.text = " ".join(shlex.quote(part) for part in cmd_parts)
+        output = await self._handle_kanban_command(event)
+        return (
+            "Chief 접수카드를 만들었습니다.\n\n"
+            f"- 라우팅: {assignee}\n"
+            f"- 근거: {', '.join(preview.get('route_evidence') or ['triage'])}\n\n"
+            f"{output}"
+        )
+
+    def _chief_auto_intake_enabled(self, event: MessageEvent) -> bool:
+        """Whether plain-text Chief intake is enabled for this platform."""
+        if not isinstance(self.config, dict):
+            return False
+        cfg = self.config.get("chief_auto_intake", {}) or {}
+        if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+            return False
+        platforms = cfg.get("platforms", ["telegram"])
+        if isinstance(platforms, str):
+            platforms = [platforms]
+        platform = event.source.platform.value if event.source and event.source.platform else ""
+        return platform in set(str(p).lower() for p in platforms)
+
+    async def _maybe_handle_chief_plain_text(
+        self,
+        event: MessageEvent,
+        command: Optional[str],
+    ) -> Optional[str]:
+        """Handle explicit plain-text Chief status/intake requests."""
+        if command or not self._chief_auto_intake_enabled(event):
+            return None
+        if event.message_type != MessageType.TEXT:
+            return None
+        raw = (event.text or "").strip()
+        if _chief_status_request(raw):
+            chief_event = dataclasses.replace(event, text="/chief status")
+            return await self._handle_chief_command(chief_event)
+        candidate = _chief_auto_intake_candidate(raw)
+        if candidate is None:
+            return None
+        if not candidate:
+            return (
+                "Chief 접수로 처리하려면 업무 내용을 함께 적어주세요.\n"
+                "예: 안전교육 인사말 검토를 담당 붙여서 진행해"
+            )
+        chief_text = (
+            f"/chief {candidate}\n\n"
+            "[자동접수 원문]\n"
+            f"{raw}"
+        )
+        chief_event = dataclasses.replace(event, text=chief_text)
+        result = await self._handle_chief_command(chief_event)
+        return "Chief 자동접수로 처리했습니다.\n\n" + result
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""

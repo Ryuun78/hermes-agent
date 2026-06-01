@@ -2134,6 +2134,97 @@ class BasePlatformAdapter(ABC):
         except (TypeError, ValueError):
             return 0
 
+    def _get_orchestra_status_config(self) -> dict:
+        """Read optional display.orchestra_status config.
+
+        Platform-specific settings under ``display.platforms.<platform>`` win.
+        Disabled by default so deployments opt in explicitly.
+        """
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            return {}
+        try:
+            cfg = _load_config()
+        except Exception:
+            return {}
+        display = cfg.get("display", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(display, dict):
+            return {}
+        merged = {}
+        base_cfg = display.get("orchestra_status", {})
+        if isinstance(base_cfg, dict):
+            merged.update(base_cfg)
+        platforms = display.get("platforms", {})
+        platform_name = _platform_name(getattr(self, "platform", None))
+        platform_cfg = {}
+        if isinstance(platforms, dict):
+            platform_cfg = platforms.get(platform_name, {})
+        if isinstance(platform_cfg, dict):
+            override = platform_cfg.get("orchestra_status", {})
+            if isinstance(override, dict):
+                merged.update(override)
+        return merged
+
+    def _append_orchestra_status_if_enabled(self, text: str) -> str:
+        """Append a compact Chief orchestra board to final gateway replies.
+
+        The helper is best-effort and never blocks message delivery. By default
+        it only appends when the rendered board shows at least one active,
+        review, blocked, or done row, avoiding noisy all-waiting footers.
+        """
+        if not text or "📍 새만금_비서실장 오케스트라" in text:
+            return text
+        cfg = self._get_orchestra_status_config()
+        if not cfg.get("enabled", False):
+            return text
+        script = str(
+            cfg.get("script")
+            or "/Users/ryuun_mac_mini/.hermes/scripts/hermes_orchestra_status.py"
+        )
+        title = str(cfg.get("title") or "현재 진행상황")
+        timeout = float(cfg.get("timeout_seconds") or 2)
+        args = [script, "--title", title]
+        if cfg.get("from_kanban", True):
+            args.append("--from-kanban")
+        try:
+            rendered = subprocess.run(
+                args,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(0.5, timeout),
+            )
+        except Exception as exc:
+            logger.debug("[%s] Orchestra status render skipped: %s", self.name, exc)
+            return text
+        if rendered.returncode != 0:
+            logger.debug(
+                "[%s] Orchestra status render failed rc=%s stderr=%s",
+                self.name,
+                rendered.returncode,
+                rendered.stderr[:200],
+            )
+            return text
+        board = rendered.stdout.strip()
+        if not board:
+            return text
+        status_rows = [
+            line
+            for line in board.splitlines()
+            if " | " in line and not line.startswith(("상태 |", "---|"))
+        ]
+        active_icons = ("🟢", "🟡", "🔴", "✅")
+        only_when_active = bool(cfg.get("only_when_active", True))
+        if only_when_active and not any(
+            any(row.startswith(icon) for icon in active_icons) for row in status_rows
+        ):
+            return text
+        max_chars = int(cfg.get("max_chars") or 1600)
+        if max_chars > 0 and len(board) > max_chars:
+            board = board[:max_chars].rstrip() + "\n..."
+        return text.rstrip() + "\n\n" + board
+
     def _schedule_ephemeral_delete(
         self,
         chat_id: str,
@@ -3861,6 +3952,7 @@ class BasePlatformAdapter(ABC):
 
                 # Send the text portion
                 if text_content and not _tts_caption_delivered:
+                    text_content = self._append_orchestra_status_if_enabled(text_content)
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     _reply_anchor = _reply_anchor_for_event(event)
                     # Mark final response messages for notification delivery.

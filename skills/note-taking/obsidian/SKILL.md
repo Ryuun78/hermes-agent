@@ -14,6 +14,10 @@ Use a known or resolved vault path before calling file tools.
 
 The documented vault-path convention is the `OBSIDIAN_VAULT_PATH` environment variable, for example from `~/.hermes/.env`. If it is unset, use `~/Documents/Obsidian Vault`.
 
+When using the `llm-wiki` skill with Obsidian, `llm-wiki` uses `OBSIDIAN_VAULT_PATH`
+as its wiki root if `WIKI_PATH` is unset. Set `WIKI_PATH` only when the wiki
+should live outside the Obsidian vault.
+
 File tools do not expand shell variables. Do not pass paths containing `$OBSIDIAN_VAULT_PATH` to `read_file`, `write_file`, `patch`, or `search_files`; resolve the vault path first and pass a concrete absolute path. Vault paths may contain spaces, which is another reason to prefer file tools over shell commands.
 
 If the vault path is unknown, `terminal` is acceptable for resolving `OBSIDIAN_VAULT_PATH` or checking whether the fallback path exists. Once the path is known, switch back to file tools.

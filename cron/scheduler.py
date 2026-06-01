@@ -848,6 +848,31 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _parse_cron_timeout(raw_value, *, default: float = 600.0, label: str = "cron timeout") -> float:
+    if raw_value not in (None, ""):
+        try:
+            return float(raw_value)
+        except (ValueError, TypeError):
+            logger.warning("Invalid %s=%r; using default %ss", label, raw_value, default)
+    return default
+
+
+def _resolve_job_timeout(job: dict) -> float:
+    """Resolve the agent inactivity timeout for a job.
+
+    Per-job values are used first so expensive media jobs can run longer
+    without changing the global default for every scheduled task. The legacy
+    HERMES_CRON_TIMEOUT environment variable remains the global fallback.
+    """
+    for key in ("timeout_seconds", "cron_timeout_seconds"):
+        value = job.get(key)
+        if value not in (None, ""):
+            return _parse_cron_timeout(value, label=key)
+
+    raw_env = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+    return _parse_cron_timeout(raw_env, label="HERMES_CRON_TIMEOUT")
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -1659,22 +1684,17 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
         # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+        # override per job with timeout_seconds / cron_timeout_seconds, or
+        # globally via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-        if _raw_cron_timeout:
-            try:
-                _cron_timeout = float(_raw_cron_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
-                    _raw_cron_timeout,
-                )
-                _cron_timeout = 600.0
-        else:
-            _cron_timeout = 600.0
+        _cron_timeout = _resolve_job_timeout(job)
+        if _cron_timeout > 0:
+            # The Codex app-server path has its own per-turn deadline. Keep it
+            # aligned with the cron inactivity limit so long media jobs are not
+            # stopped by the inner 600s default first.
+            setattr(agent, "codex_app_server_turn_timeout", _cron_timeout)
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
