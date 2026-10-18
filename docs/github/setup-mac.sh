@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ryuun78/hermes-agent 포크용 Git/GitHub 1회 세팅 스크립트.
+# hermes-agent (Ryuun78 포크 또는 기관 비공개 저장소) 용 Git/GitHub 1회 세팅 스크립트.
 #
 # 사용법 (맥 터미널, 저장소 폴더 안에서):
 #   bash docs/github/setup-mac.sh
@@ -51,11 +51,11 @@ cd "$repo_root" || exit 1
 ok "저장소 위치: $repo_root"
 
 origin_url="$(cfg remote.origin.url)"
-if [[ "$origin_url" == *"Ryuun78/hermes-agent"* ]]; then
-  ok "origin (내 포크): $origin_url"
+if [[ "$origin_url" == *"github.com"*"/hermes-agent"* && "$origin_url" != *"NousResearch/"* ]]; then
+  ok "origin (내 저장소): $origin_url"
 else
   warn "origin 주소가 예상과 다릅니다: ${origin_url:-없음}"
-  warn "이 스크립트는 Ryuun78/hermes-agent 를 기준으로 작성되었습니다."
+  warn "이 스크립트는 내 hermes-agent 저장소(포크 또는 기관 저장소)를 기준으로 작성되었습니다."
   ask "그래도 계속할까요?" || exit 1
 fi
 
